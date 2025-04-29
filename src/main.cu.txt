@@ -1,0 +1,255 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <cuda_runtime.h>
+#include <math.h>
+#include <time.h> // For basic CPU timing (optional)
+
+// Define these before including stb_image.h and stb_image_write.h
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "stb_image_write.h"
+
+// --- CUDA Error Handling ---
+// Macro to wrap CUDA calls for error checking
+#define checkCudaErrors(val) check_cuda( (val), #val, __FILE__, __LINE__ )
+
+void check_cuda(cudaError_t result, char const *const func, const char *const file, int const line) {
+    if (result) {
+        fprintf(stderr, "CUDA error = %d (%s) at %s:%d '%s'\n",
+                static_cast<int>(result), cudaGetErrorString(result), file, line, func);
+        cudaDeviceReset(); // Reset device state
+        exit(EXIT_FAILURE);
+    }
+}
+
+// --- Gaussian Kernel Generation ---
+// Generates a 1D Gaussian kernel
+void generateGaussianKernel(float *kernel, int kernelRadius, float sigma) {
+    float sum = 0.0f;
+    int kernelSize = 2 * kernelRadius + 1;
+    for (int i = -kernelRadius; i <= kernelRadius; ++i) {
+        float val = expf(-(i * i) / (2.0f * sigma * sigma));
+        kernel[i + kernelRadius] = val;
+        sum += val;
+    }
+    // Normalize the kernel
+    for (int i = 0; i < kernelSize; ++i) {
+        kernel[i] /= sum;
+        // printf("Kernel[%d] = %f\n", i, kernel[i]); // Debug print
+    }
+}
+
+// --- CUDA Kernel for Gaussian Blur ---
+// Applies separable Gaussian blur (horizontal then vertical)
+// This version processes one pixel per thread.
+// Assumes RGB image (3 channels)
+
+// Simple clamp function for boundary handling
+__device__ int clamp(int idx, int minVal, int maxVal) {
+    return max(minVal, min(idx, maxVal));
+}
+
+// Kernel for horizontal blur pass
+__global__ void gaussianBlurHorizontal(unsigned char *d_out, const unsigned char *d_in,
+                                       int width, int height,
+                                       const float *d_kernel, int kernelRadius) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (x < width && y < height) {
+        float sumR = 0.0f, sumG = 0.0f, sumB = 0.0f;
+        int kernelSize = 2 * kernelRadius + 1;
+
+        // Apply 1D horizontal kernel
+        for (int k = -kernelRadius; k <= kernelRadius; ++k) {
+            int ix = clamp(x + k, 0, width - 1); // Clamp coordinates to image bounds
+            int idx = (y * width + ix) * 3;       // Index for input pixel (RGB)
+            float weight = d_kernel[k + kernelRadius];
+
+            sumR += d_in[idx + 0] * weight;
+            sumG += d_in[idx + 1] * weight;
+            sumB += d_in[idx + 2] * weight;
+        }
+
+        int outIdx = (y * width + x) * 3;
+        d_out[outIdx + 0] = (unsigned char)clamp(sumR, 0.0f, 255.0f);
+        d_out[outIdx + 1] = (unsigned char)clamp(sumG, 0.0f, 255.0f);
+        d_out[outIdx + 2] = (unsigned char)clamp(sumB, 0.0f, 255.0f);
+    }
+}
+
+// Kernel for vertical blur pass
+__global__ void gaussianBlurVertical(unsigned char *d_out, const unsigned char *d_in,
+                                     int width, int height,
+                                     const float *d_kernel, int kernelRadius) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (x < width && y < height) {
+        float sumR = 0.0f, sumG = 0.0f, sumB = 0.0f;
+        int kernelSize = 2 * kernelRadius + 1;
+
+        // Apply 1D vertical kernel
+        for (int k = -kernelRadius; k <= kernelRadius; ++k) {
+            int iy = clamp(y + k, 0, height - 1); // Clamp coordinates to image bounds
+            int idx = (iy * width + x) * 3;        // Index for input pixel (RGB)
+            float weight = d_kernel[k + kernelRadius];
+
+            sumR += d_in[idx + 0] * weight;
+            sumG += d_in[idx + 1] * weight;
+            sumB += d_in[idx + 2] * weight;
+        }
+
+        int outIdx = (y * width + x) * 3;
+        d_out[outIdx + 0] = (unsigned char)clamp(sumR, 0.0f, 255.0f);
+        d_out[outIdx + 1] = (unsigned char)clamp(sumG, 0.0f, 255.0f);
+        d_out[outIdx + 2] = (unsigned char)clamp(sumB, 0.0f, 255.0f);
+    }
+}
+
+
+// --- Main Function ---
+int main(int argc, char **argv) {
+    // --- Argument Parsing ---
+    if (argc != 4) {
+        fprintf(stderr, "Usage: %s <input_image.png> <output_image.png> <sigma>\n", argv[0]);
+        return EXIT_FAILURE;
+    }
+    const char *inputFile = argv[1];
+    const char *outputFile = argv[2];
+    float sigma = atof(argv[3]);
+
+    if (sigma <= 0) {
+        fprintf(stderr, "Error: Sigma must be positive.\n");
+        return EXIT_FAILURE;
+    }
+
+    printf("Input file: %s\n", inputFile);
+    printf("Output file: %s\n", outputFile);
+    printf("Sigma: %.2f\n", sigma);
+
+    // --- Image Loading ---
+    int width, height, channels;
+    unsigned char *h_img_in = stbi_load(inputFile, &width, &height, &channels, 3); // Force 3 channels (RGB)
+    if (!h_img_in) {
+        fprintf(stderr, "Error loading image '%s': %s\n", inputFile, stbi_failure_reason());
+        return EXIT_FAILURE;
+    }
+    if (channels < 3) {
+         fprintf(stderr, "Warning: Input image has %d channels, converting to RGB.\n", channels);
+         // stbi_load already handled conversion if channels was 1 or 2 when asking for 3
+    } else if (channels > 3) {
+         fprintf(stderr, "Warning: Input image has %d channels, using only RGB channels.\n", channels);
+    }
+    printf("Image loaded: %d x %d pixels, %d channels (forced to 3)\n", width, height, channels);
+    size_t imgSize = width * height * 3 * sizeof(unsigned char); // 3 channels (RGB)
+
+    // --- Host Memory Allocation ---
+    unsigned char *h_img_out = (unsigned char *)malloc(imgSize);
+    if (!h_img_out) {
+        fprintf(stderr, "Error allocating host output memory.\n");
+        stbi_image_free(h_img_in);
+        return EXIT_FAILURE;
+    }
+
+    // --- Gaussian Kernel Generation ---
+    // Determine kernel radius based on sigma (common heuristic: radius = ceil(3*sigma))
+    int kernelRadius = (int)ceilf(3.0f * sigma);
+    int kernelSize = 2 * kernelRadius + 1;
+    size_t kernelSizeBytes = kernelSize * sizeof(float);
+    float *h_kernel = (float *)malloc(kernelSizeBytes);
+    if (!h_kernel) {
+        fprintf(stderr, "Error allocating host kernel memory.\n");
+        free(h_img_out);
+        stbi_image_free(h_img_in);
+        return EXIT_FAILURE;
+    }
+    printf("Generating Gaussian kernel: Radius=%d, Size=%d\n", kernelRadius, kernelSize);
+    generateGaussianKernel(h_kernel, kernelRadius, sigma);
+
+    // --- GPU Device Setup & Memory Allocation ---
+    unsigned char *d_img_in = NULL;
+    unsigned char *d_img_out = NULL;
+    unsigned char *d_intermediate = NULL; // For separable blur
+    float *d_kernel = NULL;
+
+    checkCudaErrors(cudaMalloc((void **)&d_img_in, imgSize));
+    checkCudaErrors(cudaMalloc((void **)&d_img_out, imgSize));
+    checkCudaErrors(cudaMalloc((void **)&d_intermediate, imgSize)); // Intermediate buffer
+    checkCudaErrors(cudaMalloc((void **)&d_kernel, kernelSizeBytes));
+
+    printf("CUDA memory allocated.\n");
+
+    // --- Data Transfer: Host to Device ---
+    checkCudaErrors(cudaMemcpy(d_img_in, h_img_in, imgSize, cudaMemcpyHostToDevice));
+    checkCudaErrors(cudaMemcpy(d_kernel, h_kernel, kernelSizeBytes, cudaMemcpyHostToDevice));
+    printf("Data transferred to GPU.\n");
+
+    // --- CUDA Kernel Launch Configuration ---
+    // Use 2D blocks, e.g., 16x16 or 32x32
+    dim3 blockSize(16, 16);
+    dim3 gridSize((width + blockSize.x - 1) / blockSize.x,
+                  (height + blockSize.y - 1) / blockSize.y);
+
+    printf("Grid size: (%u, %u), Block size: (%u, %u)\n", gridSize.x, gridSize.y, blockSize.x, blockSize.y);
+
+    // --- CUDA Events for Timing (Optional but good practice) ---
+    cudaEvent_t start, stop;
+    checkCudaErrors(cudaEventCreate(&start));
+    checkCudaErrors(cudaEventCreate(&stop));
+
+    // --- Kernel Execution ---
+    printf("Launching CUDA kernels...\n");
+    checkCudaErrors(cudaEventRecord(start)); // Start timer
+
+    // 1. Horizontal Pass: d_img_in -> d_intermediate
+    gaussianBlurHorizontal<<<gridSize, blockSize>>>(d_intermediate, d_img_in, width, height, d_kernel, kernelRadius);
+    checkCudaErrors(cudaGetLastError()); // Check for kernel launch errors
+
+    // 2. Vertical Pass: d_intermediate -> d_img_out
+    gaussianBlurVertical<<<gridSize, blockSize>>>(d_img_out, d_intermediate, width, height, d_kernel, kernelRadius);
+    checkCudaErrors(cudaGetLastError()); // Check for kernel launch errors
+
+    checkCudaErrors(cudaEventRecord(stop)); // Stop timer
+    checkCudaErrors(cudaEventSynchronize(stop)); // Wait for GPU to finish
+    printf("Kernels finished.\n");
+
+    // Calculate elapsed time
+    float milliseconds = 0;
+    checkCudaErrors(cudaEventElapsedTime(&milliseconds, start, stop));
+    printf("GPU Execution Time: %.3f ms\n", milliseconds);
+
+    // --- Data Transfer: Device to Host ---
+    checkCudaErrors(cudaMemcpy(h_img_out, d_img_out, imgSize, cudaMemcpyDeviceToHost));
+    printf("Results transferred back to CPU.\n");
+
+    // --- Image Saving ---
+    // Use stbi_write_png for lossless output, or stbi_write_jpg for lossy
+    int success = stbi_write_png(outputFile, width, height, 3, h_img_out, width * 3); // width * 3 is the stride
+    if (!success) {
+        fprintf(stderr, "Error writing output image '%s'\n", outputFile);
+    } else {
+        printf("Blurred image saved successfully to %s\n", outputFile);
+    }
+
+    // --- Cleanup ---
+    printf("Cleaning up resources...\n");
+    checkCudaErrors(cudaEventDestroy(start));
+    checkCudaErrors(cudaEventDestroy(stop));
+
+    checkCudaErrors(cudaFree(d_img_in));
+    checkCudaErrors(cudaFree(d_img_out));
+    checkCudaErrors(cudaFree(d_intermediate));
+    checkCudaErrors(cudaFree(d_kernel));
+
+    free(h_kernel);
+    free(h_img_out);
+    stbi_image_free(h_img_in); // Free memory allocated by stbi_load
+
+    // Optional: Reset device if needed, though not strictly necessary at program end
+    // checkCudaErrors(cudaDeviceReset());
+
+    printf("Finished.\n");
+    return EXIT_SUCCESS;
+}

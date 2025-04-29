@@ -1,0 +1,21 @@
+# Compiled files
+*.o
+*.exe
+blur_image
+
+# Output directory
+output/
+
+# Build directories (if any)
+build/
+bin/
+
+# IDE files
+.vscode/
+*.suo
+*.user
+*.sln
+*.vcxproj*
+
+# Mac specific
+.DS_Store

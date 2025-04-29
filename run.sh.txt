@@ -1,0 +1,51 @@
+```bash
+#!/bin/bash
+
+# Script to run the CUDA Gaussian Blur executable
+
+# --- Configuration ---
+INPUT_IMAGE="data/input.png"
+OUTPUT_DIR="output"
+OUTPUT_IMAGE="${OUTPUT_DIR}/blurred_image.png"
+SIGMA="5.0" # Adjust sigma for different blur levels (e.g., 2.0, 10.0)
+EXECUTABLE="./blur_image"
+
+# --- Check for Input Image ---
+if [ ! -f "$INPUT_IMAGE" ]; then
+    echo "Error: Input image not found at $INPUT_IMAGE"
+    echo "Please place an image named 'input.png' in the 'data/' directory."
+    exit 1
+fi
+
+# --- Check for Executable ---
+if [ ! -x "$EXECUTABLE" ]; then
+    echo "Error: Executable '$EXECUTABLE' not found or not executable."
+    echo "Did you compile the project using 'make'?"
+    exit 1
+fi
+
+# --- Create Output Directory ---
+mkdir -p "$OUTPUT_DIR"
+
+# --- Run the Program ---
+echo "Running CUDA Gaussian Blur..."
+echo "Input: $INPUT_IMAGE"
+echo "Output: $OUTPUT_IMAGE"
+echo "Sigma: $SIGMA"
+echo "Command: $EXECUTABLE $INPUT_IMAGE $OUTPUT_IMAGE $SIGMA"
+echo "------------------------------------------"
+
+# Execute the command
+$EXECUTABLE "$INPUT_IMAGE" "$OUTPUT_IMAGE" "$SIGMA"
+
+# --- Check Exit Status ---
+status=$?
+echo "------------------------------------------"
+if [ $status -eq 0 ]; then
+    echo "Execution finished successfully."
+    echo "Output image saved to $OUTPUT_IMAGE"
+else
+    echo "Error: Execution failed with status $status."
+fi
+
+exit $status

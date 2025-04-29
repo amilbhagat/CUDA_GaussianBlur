@@ -1,0 +1,39 @@
+# Compiler
+NVCC = nvcc
+
+# Executable name
+EXECUTABLE = blur_image
+
+# Source files
+SOURCES = src/main.cu
+
+# Build directory (optional, simple build for this example)
+# BUILD_DIR = build
+
+# Output directory for executable
+BIN_DIR = .
+
+# Compiler flags
+# Adjust -arch=sm_XX to match your GPU's compute capability or a common one like sm_75
+# Common options: sm_60, sm_61, sm_70, sm_75, sm_80, sm_86
+NVCC_FLAGS = -O3 -arch=sm_75 -std=c++11
+
+# Include directories
+INCLUDES = -Isrc
+
+# Libraries
+LIBS =
+
+# Default target
+all: $(BIN_DIR)/$(EXECUTABLE)
+
+# Link executable
+$(BIN_DIR)/$(EXECUTABLE): $(SOURCES)
+	$(NVCC) $(NVCC_FLAGS) $(INCLUDES) $^ -o $@ $(LIBS)
+
+# Clean build files
+clean:
+	rm -f $(BIN_DIR)/$(EXECUTABLE) output/*.png
+
+# Phony targets
+.PHONY: all clean
